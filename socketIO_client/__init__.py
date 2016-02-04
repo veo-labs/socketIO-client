@@ -6,9 +6,9 @@ from .namespaces import (
     find_callback)
 from .parsers import (
     parse_host, parse_engineIO_session,
-    format_socketIO_packet_data, parse_socketIO_packet_data,
+    format_socketIO_packet_data, parse_socketIO_packet,
     get_namespace_path)
-from .symmetries import get_character
+from .symmetries import get_character, get_int
 from .transports import (
     WebsocketTransport, XHR_PollingTransport, prepare_http_session, TRANSPORTS)
 
@@ -198,7 +198,9 @@ class EngineIO(LoggingMixin):
 
     @retry
     def _message(self, engineIO_packet_data, with_transport_instance=False):
-        engineIO_packet_type = 4
+        engineIO_packet_type = '4'
+        if isinstance(engineIO_packet_data, bytearray):
+            engineIO_packet_type = 'b' + engineIO_packet_type
         if with_transport_instance:
             transport = self._transport_instance
         else:
@@ -326,6 +328,7 @@ class SocketIO(EngineIO):
         self._namespace_by_path = {}
         self._callback_by_ack_id = {}
         self._ack_id = 0
+        self.placeholder = None
         super(SocketIO, self).__init__(
             host, port, Namespace, wait_for_connection, transports,
             resource, hurry_interval_in_seconds, **kw)
@@ -376,7 +379,7 @@ class SocketIO(EngineIO):
 
     def connect(self, path, with_transport_instance=False):
         socketIO_packet_type = 0
-        socketIO_packet_data = format_socketIO_packet_data(path)
+        socketIO_packet_data, _ = format_socketIO_packet_data(path)
         self._message(
             str(socketIO_packet_type) + socketIO_packet_data,
             with_transport_instance)
@@ -386,7 +389,7 @@ class SocketIO(EngineIO):
             self._close()
         elif path:
             socketIO_packet_type = 1
-            socketIO_packet_data = format_socketIO_packet_data(path)
+            socketIO_packet_data, _ = format_socketIO_packet_data(path)
             try:
                 self._message(str(socketIO_packet_type) + socketIO_packet_data)
             except (TimeoutError, ConnectionError):
@@ -398,13 +401,19 @@ class SocketIO(EngineIO):
             pass
 
     def emit(self, event, *args, **kw):
+        socketIO_packet_type = 2
         path = kw.get('path', '')
         callback, args = find_callback(args, kw)
         ack_id = self._set_ack_callback(callback) if callback else None
         args = [event] + list(args)
-        socketIO_packet_type = 2
-        socketIO_packet_data = format_socketIO_packet_data(path, ack_id, args)
+        socketIO_packet_data, binary_packets = format_socketIO_packet_data(
+            path, ack_id, args)
+        if binary_packets:
+            socketIO_packet_type += 3
         self._message(str(socketIO_packet_type) + socketIO_packet_data)
+
+        for packet in binary_packets:
+            self._message(packet)
 
     def send(self, data='', callback=None, **kw):
         path = kw.get('path', '')
@@ -415,8 +424,14 @@ class SocketIO(EngineIO):
 
     def _ack(self, path, ack_id, *args):
         socketIO_packet_type = 3
-        socketIO_packet_data = format_socketIO_packet_data(path, ack_id, args)
+        socketIO_packet_data, binary_packets = format_socketIO_packet_data(
+            path, ack_id, args)
+        if binary_packets:
+            socketIO_packet_type += 3
         self._message(str(socketIO_packet_type) + socketIO_packet_data)
+
+        for packet in binary_packets:
+            self._message(packet)
 
     # React
 
@@ -440,11 +455,20 @@ class SocketIO(EngineIO):
         if engineIO_packet_data is None:
             return
         self._debug('[socket.io packet received] %s', engineIO_packet_data)
-        socketIO_packet_type = int(get_character(engineIO_packet_data, 0))
-        socketIO_packet_data = engineIO_packet_data[1:]
-        # Launch callbacks
-        path = get_namespace_path(socketIO_packet_data)
-        namespace = self.get_namespace(path)
+
+        if self.placeholder:
+            self.placeholder.add(engineIO_packet_data)
+
+            if not self.placeholder.finished:
+                return engineIO_packet_data
+
+            packet = self.placeholder
+            self.placeholder = None
+            packet.type -= 3
+        else:
+            packet = parse_socketIO_packet(engineIO_packet_data)
+            packet.namespace = self.get_namespace(packet.path)
+
         try:
             delegate = {
                 0: self._on_connect,
@@ -454,49 +478,47 @@ class SocketIO(EngineIO):
                 4: self._on_error,
                 5: self._on_binary_event,
                 6: self._on_binary_ack,
-            }[socketIO_packet_type]
+            }[packet.type]
         except KeyError:
             raise PacketError(
-                'unexpected socket.io packet type (%s)' % socketIO_packet_type)
-        delegate(socketIO_packet_data, namespace)
-        return socketIO_packet_data
+                'unexpected socket.io packet type (%s)' % packet.type)
+        delegate(packet)
+        return packet
 
-    def _on_connect(self, data, namespace):
-        namespace._connected = True
-        namespace._find_packet_callback('connect')()
+    def _on_connect(self, packet):
+        packet.namespace._connected = True
+        packet.namespace._find_packet_callback('connect')()
 
-    def _on_disconnect(self, data, namespace):
-        namespace._connected = False
-        namespace._find_packet_callback('disconnect')()
+    def _on_disconnect(self, packet):
+        packet.namespace._connected = False
+        packet.namespace._find_packet_callback('disconnect')()
 
-    def _on_event(self, data, namespace):
-        data_parsed = parse_socketIO_packet_data(data)
-        args = data_parsed.args
+    def _on_event(self, packet):
+        args = packet.args
         try:
             event = args.pop(0)
         except IndexError:
             raise PacketError('missing event name')
-        if data_parsed.ack_id is not None:
+        if packet.ack_id is not None:
             args.append(self._prepare_to_send_ack(
-                data_parsed.path, data_parsed.ack_id))
-        namespace._find_packet_callback(event)(*args)
+                packet.path, packet.ack_id))
+        packet.namespace._find_packet_callback(event)(*args)
 
-    def _on_ack(self, data, namespace):
-        data_parsed = parse_socketIO_packet_data(data)
+    def _on_ack(self, packet):
         try:
-            ack_callback = self._get_ack_callback(data_parsed.ack_id)
+            ack_callback = self._get_ack_callback(packet.ack_id)
         except KeyError:
             return
-        ack_callback(*data_parsed.args)
+        ack_callback(*packet.args)
 
-    def _on_error(self, data, namespace):
-        namespace._find_packet_callback('error')(data)
+    def _on_error(self, packet):
+        packet.namespace._find_packet_callback('error')(packet.args)
 
-    def _on_binary_event(self, data, namespace):
-        self._warn('[not implemented] binary event')
+    def _on_binary_event(self, packet):
+        self.placeholder = packet
 
-    def _on_binary_ack(self, data, namespace):
-        self._warn('[not implemented] binary ack')
+    def _on_binary_ack(self, packet):
+        self.placeholder = packet
 
     def _prepare_to_send_ack(self, path, ack_id):
         'Return function that acknowledges the server'
